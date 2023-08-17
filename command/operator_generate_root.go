@@ -1,79 +1,146 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package command
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 
-	"github.com/hashicorp/errwrap"
-	uuid "github.com/hashicorp/go-uuid"
+	"github.com/hashicorp/go-secure-stdlib/password"
 	"github.com/hashicorp/vault/api"
-	"github.com/hashicorp/vault/helper/base62"
-	"github.com/hashicorp/vault/helper/password"
 	"github.com/hashicorp/vault/helper/pgpkeys"
-	"github.com/hashicorp/vault/helper/xor"
+	"github.com/hashicorp/vault/sdk/helper/roottoken"
 	"github.com/mitchellh/cli"
 	"github.com/posener/complete"
 )
 
-var _ cli.Command = (*OperatorGenerateRootCommand)(nil)
-var _ cli.CommandAutocomplete = (*OperatorGenerateRootCommand)(nil)
+var (
+	_ cli.Command             = (*OperatorGenerateRootCommand)(nil)
+	_ cli.CommandAutocomplete = (*OperatorGenerateRootCommand)(nil)
+)
+
+type generateRootKind int
+
+const (
+	generateRootRegular generateRootKind = iota
+	generateRootDR
+	generateRootRecovery
+)
 
 type OperatorGenerateRootCommand struct {
 	*BaseCommand
 
-	flagInit        bool
-	flagCancel      bool
-	flagStatus      bool
-	flagDecode      string
-	flagOTP         string
-	flagPGPKey      string
-	flagNonce       string
-	flagGenerateOTP bool
-	flagDRToken     bool
+	flagInit          bool
+	flagCancel        bool
+	flagStatus        bool
+	flagDecode        string
+	flagOTP           string
+	flagPGPKey        string
+	flagNonce         string
+	flagGenerateOTP   bool
+	flagDRToken       bool
+	flagRecoveryToken bool
 
 	testStdin io.Reader // for tests
 }
 
 func (c *OperatorGenerateRootCommand) Synopsis() string {
-	return "Generates a new root token"
+	return "Generates a new root, DR operation, or recovery token"
 }
 
 func (c *OperatorGenerateRootCommand) Help() string {
 	helpText := `
-Usage: vault operator generate-root [options] [KEY]
+Usage: vault operator generate-root [options] -init [-otp=...] [-pgp-key=...]
+       vault operator generate-root [options] [-nonce=... KEY]
+       vault operator generate-root [options] -decode=... -otp=...
+       vault operator generate-root [options] -generate-otp
+       vault operator generate-root [options] -status
+       vault operator generate-root [options] -cancel
 
-  Generates a new root token by combining a quorum of share holders. One of
-  the following must be provided to start the root token generation:
+  Generates a new root token by combining a quorum of share holders.
 
-    - A base64-encoded one-time-password (OTP) provided via the "-otp" flag.
-      Use the "-generate-otp" flag to generate a usable value. The resulting
-      token is XORed with this value when it is returned. Use the "-decode"
-      flag to output the final value.
+  This command is unusual, as it is effectively six separate subcommands,
+  selected via the options -init, -decode, -generate-otp, -status, -cancel, 
+  or the absence of any of the previous five options (which selects the 
+  "provide a key share" form).
 
-    - A file containing a PGP key or a keybase username in the "-pgp-key"
-      flag. The resulting token is encrypted with this public key.
+  With the -dr-token or -recovery-token options, a DR operation token or a
+  recovery token is generated instead of a root token - the relevant option
+  must be included in every form of the generate-root command.
 
-  An unseal key may be provided directly on the command line as an argument to
-  the command. If key is specified as "-", the command will read from stdin. If
-  a TTY is available, the command will prompt for text.
+  Form 1 (-init) - Start a token generation:
 
-  Generate an OTP code for the final token:
+    When starting a root or privileged operation token generation, you must
+    choose one of the following protection methods for how the token will be
+    returned:
 
-      $ vault operator generate-root -generate-otp
+      - A base64-encoded one-time-password (OTP). The resulting token is XORed
+        with this value when it is returned. Use the "-decode" form of this
+        command to output the final value.
 
-  Start a root token generation:
+        The Vault server will generate a suitable OTP for you, and return it:
 
-      $ vault operator generate-root -init -otp="..."
-      $ vault operator generate-root -init -pgp-key="..."
+            $ vault operator generate-root -init
 
-  Enter an unseal key to progress root token generation:
+        Vault versions before 0.11.2, released in 2018, required you to
+        generate your own OTP (see the "-generate-otp" form) and pass it in,
+        but this is no longer necessary. The command is still supported for
+        compatibility, though:
 
-      $ vault operator generate-root -otp="..."
+            $ vault operator generate-root -init -otp="..."
+
+      - A PGP key. The resulting token is encrypted with this public key.
+        The key may be specified as a path to a file, or a string of the
+        form "keybase:<username>" to fetch the key from the keybase.io API.
+
+            $ vault operator generate-root -init -pgp-key="..."
+
+  Form 2 (no option) - Enter an unseal key to progress root token generation:
+
+    In the sub-form intended for interactive use, the command will
+    automatically look up the nonce of the currently active generation
+    operation, and will prompt for the key to be entered:
+
+        $ vault operator generate-root
+
+    In the sub-form intended for automation, the operation nonce must be
+    explicitly provided, and the key is provided directly on the command line
+
+        $ vault operator generate-root -nonce=... KEY
+
+    If key is specified as "-", the command will read from stdin.
+
+  Form 3 (-decode) - Decode a generated token protected with an OTP:
+
+        $ vault operator generate-root -decode=ENCODED_TOKEN -otp=OTP
+
+    If encoded token is specified as "-", the command will read from stdin.
+
+  Form 4 (-generate-otp) - Generate an OTP code for the final token:
+
+        $ vault operator generate-root -generate-otp
+
+    Since changes in Vault 0.11.2 in 2018, there is no longer any reason to
+    use this form, as a suitable OTP will be returned as part of the "-init"
+    command.
+
+  Form 5 (-status) - Get the status of a token generation that is in progress:
+
+        $ vault operator generate-root -status
+
+    This form also returns the length of the a correct OTP, for the running
+    version and configuration of Vault.
+
+  Form 6 (-cancel) - Cancel a token generation that is in progress:
+
+    This would be used to remove an in progress generation operation, so that
+    a new one can be started with different parameters.
+
+        $ vault operator generate-root -cancel
 
 ` + c.Flags().Help()
 	return strings.TrimSpace(helpText)
@@ -120,7 +187,8 @@ func (c *OperatorGenerateRootCommand) Flags() *FlagSets {
 		Default:    "",
 		EnvVar:     "",
 		Completion: complete.PredictAnything,
-		Usage:      "The value to decode; setting this triggers a decode operation.",
+		Usage: "The value to decode; setting this triggers a decode operation. " +
+			" If the value is \"-\" then read the encoded token from stdin.",
 	})
 
 	f.BoolVar(&BoolVar{
@@ -139,7 +207,17 @@ func (c *OperatorGenerateRootCommand) Flags() *FlagSets {
 		Default:    false,
 		EnvVar:     "",
 		Completion: complete.PredictNothing,
-		Usage: "Set this flag to do generate root operations on DR Operational " +
+		Usage: "Set this flag to do generate root operations on DR operation " +
+			"tokens.",
+	})
+
+	f.BoolVar(&BoolVar{
+		Name:       "recovery-token",
+		Target:     &c.flagRecoveryToken,
+		Default:    false,
+		EnvVar:     "",
+		Completion: complete.PredictNothing,
+		Usage: "Set this flag to do generate root operations on recovery " +
 			"tokens.",
 	})
 
@@ -159,10 +237,10 @@ func (c *OperatorGenerateRootCommand) Flags() *FlagSets {
 		EnvVar:     "",
 		Completion: complete.PredictAnything,
 		Usage: "Path to a file on disk containing a binary or base64-encoded " +
-			"public GPG key. This can also be specified as a Keybase username " +
+			"public PGP key. This can also be specified as a Keybase username " +
 			"using the format \"keybase:<username>\". When supplied, the generated " +
 			"root token will be encrypted and base64-encoded with the given public " +
-			"key.",
+			"key. Must be used with \"-init\".",
 	})
 
 	f.StringVar(&StringVar{
@@ -171,8 +249,9 @@ func (c *OperatorGenerateRootCommand) Flags() *FlagSets {
 		Default:    "",
 		EnvVar:     "",
 		Completion: complete.PredictAnything,
-		Usage: "Nonce value provided at initialization. The same nonce value " +
-			"must be provided with each unseal key.",
+		Usage: "Nonce value returned at initialization. The same nonce value " +
+			"must be provided with each unseal or recovery key. Only needed " +
+			"when providing an unseal or recovery key.",
 	})
 
 	return set
@@ -200,79 +279,88 @@ func (c *OperatorGenerateRootCommand) Run(args []string) int {
 		return 1
 	}
 
+	if c.flagDRToken && c.flagRecoveryToken {
+		c.UI.Error("Both -recovery-token and -dr-token flags are set")
+		return 1
+	}
+
 	client, err := c.Client()
 	if err != nil {
 		c.UI.Error(err.Error())
 		return 2
 	}
 
+	kind := generateRootRegular
+	switch {
+	case c.flagDRToken:
+		kind = generateRootDR
+	case c.flagRecoveryToken:
+		kind = generateRootRecovery
+	}
+
 	switch {
 	case c.flagGenerateOTP:
-		otp, code := c.generateOTP(client, c.flagDRToken)
+		otp, code := c.generateOTP(client, kind)
 		if code == 0 {
-			return PrintRaw(c.UI, otp)
+			switch Format(c.UI) {
+			case "", "table":
+				return PrintRaw(c.UI, otp)
+			default:
+				status := map[string]interface{}{
+					"otp":        otp,
+					"otp_length": len(otp),
+				}
+				return OutputData(c.UI, status)
+			}
 		}
 		return code
 	case c.flagDecode != "":
-		return c.decode(client, c.flagDecode, c.flagOTP, c.flagDRToken)
+		return c.decode(client, c.flagDecode, c.flagOTP, kind)
 	case c.flagCancel:
-		return c.cancel(client, c.flagDRToken)
+		return c.cancel(client, kind)
 	case c.flagInit:
-		return c.init(client, c.flagOTP, c.flagPGPKey, c.flagDRToken)
+		return c.init(client, c.flagOTP, c.flagPGPKey, kind)
 	case c.flagStatus:
-		return c.status(client, c.flagDRToken)
+		return c.status(client, kind)
 	default:
 		// If there are no other flags, prompt for an unseal key.
 		key := ""
 		if len(args) > 0 {
 			key = strings.TrimSpace(args[0])
 		}
-		return c.provide(client, key, c.flagDRToken)
+		return c.provide(client, key, kind)
 	}
 }
 
 // generateOTP generates a suitable OTP code for generating a root token.
-func (c *OperatorGenerateRootCommand) generateOTP(client *api.Client, drToken bool) (string, int) {
+func (c *OperatorGenerateRootCommand) generateOTP(client *api.Client, kind generateRootKind) (string, int) {
 	f := client.Sys().GenerateRootStatus
-	if drToken {
+	switch kind {
+	case generateRootDR:
 		f = client.Sys().GenerateDROperationTokenStatus
+	case generateRootRecovery:
+		f = client.Sys().GenerateRecoveryOperationTokenStatus
 	}
+
 	status, err := f()
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error getting root generation status: %s", err))
 		return "", 2
 	}
 
-	switch status.OTPLength {
-	case 0:
-		// This is the fallback case
-		buf := make([]byte, 16)
-		readLen, err := rand.Read(buf)
-		if err != nil {
-			c.UI.Error(fmt.Sprintf("Error reading random bytes: %s", err))
-			return "", 2
-		}
-
-		if readLen != 16 {
-			c.UI.Error(fmt.Sprintf("Read %d bytes when we should have read 16", readLen))
-			return "", 2
-		}
-
-		return base64.StdEncoding.EncodeToString(buf), 0
-
-	default:
-		otp, err := base62.Random(status.OTPLength)
-		if err != nil {
-			c.UI.Error(errwrap.Wrapf("Error reading random bytes: {{err}}", err).Error())
-			return "", 2
-		}
-
-		return otp, 0
+	otp, err := roottoken.GenerateOTP(status.OTPLength)
+	var retCode int
+	if err != nil {
+		retCode = 2
+		c.UI.Error(err.Error())
+	} else {
+		retCode = 0
 	}
+	return otp, retCode
 }
 
 // decode decodes the given value using the otp.
-func (c *OperatorGenerateRootCommand) decode(client *api.Client, encoded, otp string, drToken bool) int {
+func (c *OperatorGenerateRootCommand) decode(client *api.Client, encoded, otp string, kind generateRootKind) int {
 	if encoded == "" {
 		c.UI.Error("Missing encoded value: use -decode=<string> to supply it")
 		return 1
@@ -282,52 +370,60 @@ func (c *OperatorGenerateRootCommand) decode(client *api.Client, encoded, otp st
 		return 1
 	}
 
-	f := client.Sys().GenerateRootStatus
-	if drToken {
-		f = client.Sys().GenerateDROperationTokenStatus
+	if encoded == "-" {
+		// Pull our fake stdin if needed
+		stdin := (io.Reader)(os.Stdin)
+		if c.testStdin != nil {
+			stdin = c.testStdin
+		}
+
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, stdin); err != nil {
+			c.UI.Error(fmt.Sprintf("Failed to read from stdin: %s", err))
+			return 1
+		}
+
+		encoded = buf.String()
+
+		if encoded == "" {
+			c.UI.Error("Missing encoded value. When using -decode=\"-\" value must be passed via stdin.")
+			return 1
+		}
 	}
+
+	f := client.Sys().GenerateRootStatus
+	switch kind {
+	case generateRootDR:
+		f = client.Sys().GenerateDROperationTokenStatus
+	case generateRootRecovery:
+		f = client.Sys().GenerateRecoveryOperationTokenStatus
+	}
+
 	status, err := f()
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error getting root generation status: %s", err))
 		return 2
 	}
 
-	switch status.OTPLength {
-	case 0:
-		// Backwards compat
-		tokenBytes, err := xor.XORBase64(encoded, otp)
-		if err != nil {
-			c.UI.Error(fmt.Sprintf("Error xoring token: %s", err))
-			return 1
-		}
+	token, err := roottoken.DecodeToken(encoded, otp, status.OTPLength)
+	if err != nil {
+		c.UI.Error(fmt.Sprintf("Error decoding root token: %s", err))
+		return 1
+	}
 
-		token, err := uuid.FormatUUID(tokenBytes)
-		if err != nil {
-			c.UI.Error(fmt.Sprintf("Error formatting base64 token value: %s", err))
-			return 1
-		}
-
-		return PrintRaw(c.UI, strings.TrimSpace(token))
-
+	switch Format(c.UI) {
+	case "", "table":
+		return PrintRaw(c.UI, token)
 	default:
-		tokenBytes, err := base64.RawStdEncoding.DecodeString(encoded)
-		if err != nil {
-			c.UI.Error(errwrap.Wrapf("Error decoding base64'd token: {{err}}", err).Error())
-			return 1
+		tokenJSON := map[string]interface{}{
+			"token": token,
 		}
-
-		tokenBytes, err = xor.XORBytes(tokenBytes, []byte(otp))
-		if err != nil {
-			c.UI.Error(errwrap.Wrapf("Error xoring token: {{err}}", err).Error())
-			return 1
-		}
-
-		return PrintRaw(c.UI, string(tokenBytes))
+		return OutputData(c.UI, tokenJSON)
 	}
 }
 
 // init is used to start the generation process
-func (c *OperatorGenerateRootCommand) init(client *api.Client, otp, pgpKey string, drToken bool) int {
+func (c *OperatorGenerateRootCommand) init(client *api.Client, otp, pgpKey string, kind generateRootKind) int {
 	// Validate incoming fields. Either OTP OR PGP keys must be supplied.
 	if otp != "" && pgpKey != "" {
 		c.UI.Error("Error initializing: cannot specify both -otp and -pgp-key")
@@ -336,8 +432,11 @@ func (c *OperatorGenerateRootCommand) init(client *api.Client, otp, pgpKey strin
 
 	// Start the root generation
 	f := client.Sys().GenerateRootInit
-	if drToken {
+	switch kind {
+	case generateRootDR:
 		f = client.Sys().GenerateDROperationTokenInit
+	case generateRootRecovery:
+		f = client.Sys().GenerateRecoveryOperationTokenInit
 	}
 	status, err := f(otp, pgpKey)
 	if err != nil {
@@ -355,10 +454,13 @@ func (c *OperatorGenerateRootCommand) init(client *api.Client, otp, pgpKey strin
 
 // provide prompts the user for the seal key and posts it to the update root
 // endpoint. If this is the last unseal, this function outputs it.
-func (c *OperatorGenerateRootCommand) provide(client *api.Client, key string, drToken bool) int {
+func (c *OperatorGenerateRootCommand) provide(client *api.Client, key string, kind generateRootKind) int {
 	f := client.Sys().GenerateRootStatus
-	if drToken {
+	switch kind {
+	case generateRootDR:
 		f = client.Sys().GenerateDROperationTokenStatus
+	case generateRootRecovery:
+		f = client.Sys().GenerateRecoveryOperationTokenStatus
 	}
 	status, err := f()
 	if err != nil {
@@ -437,8 +539,11 @@ func (c *OperatorGenerateRootCommand) provide(client *api.Client, key string, dr
 
 	// Provide the key, this may potentially complete the update
 	fUpd := client.Sys().GenerateRootUpdate
-	if drToken {
+	switch kind {
+	case generateRootDR:
 		fUpd = client.Sys().GenerateDROperationTokenUpdate
+	case generateRootRecovery:
+		fUpd = client.Sys().GenerateRecoveryOperationTokenUpdate
 	}
 	status, err = fUpd(key, nonce)
 	if err != nil {
@@ -454,10 +559,13 @@ func (c *OperatorGenerateRootCommand) provide(client *api.Client, key string, dr
 }
 
 // cancel cancels the root token generation
-func (c *OperatorGenerateRootCommand) cancel(client *api.Client, drToken bool) int {
+func (c *OperatorGenerateRootCommand) cancel(client *api.Client, kind generateRootKind) int {
 	f := client.Sys().GenerateRootCancel
-	if drToken {
+	switch kind {
+	case generateRootDR:
 		f = client.Sys().GenerateDROperationTokenCancel
+	case generateRootRecovery:
+		f = client.Sys().GenerateRecoveryOperationTokenCancel
 	}
 	if err := f(); err != nil {
 		c.UI.Error(fmt.Sprintf("Error canceling root token generation: %s", err))
@@ -468,11 +576,15 @@ func (c *OperatorGenerateRootCommand) cancel(client *api.Client, drToken bool) i
 }
 
 // status is used just to fetch and dump the status
-func (c *OperatorGenerateRootCommand) status(client *api.Client, drToken bool) int {
+func (c *OperatorGenerateRootCommand) status(client *api.Client, kind generateRootKind) int {
 	f := client.Sys().GenerateRootStatus
-	if drToken {
+	switch kind {
+	case generateRootDR:
 		f = client.Sys().GenerateDROperationTokenStatus
+	case generateRootRecovery:
+		f = client.Sys().GenerateRecoveryOperationTokenStatus
 	}
+
 	status, err := f()
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error getting root generation status: %s", err))

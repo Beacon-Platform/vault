@@ -1,8 +1,14 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package vault
 
 import (
 	"context"
-	"fmt"
+
+	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
+
+	"github.com/hashicorp/vault/vault/seal"
 )
 
 // SealAccess is a wrapper around Seal that exposes accessor methods
@@ -16,11 +22,11 @@ func NewSealAccess(seal Seal) *SealAccess {
 	return &SealAccess{seal: seal}
 }
 
-func (s *SealAccess) StoredKeysSupported() bool {
+func (s *SealAccess) StoredKeysSupported() seal.StoredKeysSupport {
 	return s.seal.StoredKeysSupported()
 }
 
-func (s *SealAccess) BarrierType() string {
+func (s *SealAccess) BarrierType() wrapping.WrapperType {
 	return s.seal.BarrierType()
 }
 
@@ -40,6 +46,7 @@ func (s *SealAccess) VerifyRecoveryKey(ctx context.Context, key []byte) error {
 	return s.seal.VerifyRecoveryKey(ctx, key)
 }
 
+// TODO(SEALHA): This looks like it belongs in Seal instead, it only has two callers
 func (s *SealAccess) ClearCaches(ctx context.Context) {
 	s.seal.SetBarrierConfig(ctx, nil)
 	if s.RecoveryKeySupported() {
@@ -47,21 +54,6 @@ func (s *SealAccess) ClearCaches(ctx context.Context) {
 	}
 }
 
-type SealAccessTestingParams struct {
-	PretendToAllowStoredShares bool
-	PretendToAllowRecoveryKeys bool
-	PretendRecoveryKey         []byte
-}
-
-func (s *SealAccess) SetTestingParams(params *SealAccessTestingParams) error {
-	d, ok := s.seal.(*defaultSeal)
-	if !ok {
-		return fmt.Errorf("not a defaultseal")
-	}
-	d.PretendToAllowRecoveryKeys = params.PretendToAllowRecoveryKeys
-	d.PretendToAllowStoredShares = params.PretendToAllowStoredShares
-	if params.PretendRecoveryKey != nil {
-		d.PretendRecoveryKey = params.PretendRecoveryKey
-	}
-	return nil
+func (s *SealAccess) GetAccess() seal.Access {
+	return s.seal.GetAccess()
 }

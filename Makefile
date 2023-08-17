@@ -2,20 +2,25 @@
 # Be sure to place this BEFORE `include` directives, if any.
 THIS_FILE := $(lastword $(MAKEFILE_LIST))
 
-TEST?=$$(go list ./... | grep -v /vendor/ | grep -v /integ)
-TEST_TIMEOUT?=20m
-EXTENDED_TEST_TIMEOUT=45m
+TEST?=$$($(GO_CMD) list ./... | grep -v /vendor/ | grep -v /integ)
+TEST_TIMEOUT?=45m
+EXTENDED_TEST_TIMEOUT=60m
+INTEG_TEST_TIMEOUT=120m
 VETARGS?=-asmdecl -atomic -bool -buildtags -copylocks -methods -nilfunc -printf -rangeloops -shift -structtags -unsafeptr
+EXTERNAL_TOOLS_CI=\
+	golang.org/x/tools/cmd/goimports \
+	github.com/golangci/revgrep/cmd/revgrep \
+	mvdan.cc/gofumpt \
+	honnef.co/go/tools/cmd/staticcheck \
+	github.com/bufbuild/buf/cmd/buf
 EXTERNAL_TOOLS=\
-	github.com/elazarl/go-bindata-assetfs/... \
-	github.com/hashicorp/go-bindata/... \
-	github.com/mitchellh/gox \
-	github.com/kardianos/govendor \
 	github.com/client9/misspell/cmd/misspell
-GOFMT_FILES?=$$(find . -name '*.go' | grep -v vendor)
+GOFMT_FILES?=$$(find . -name '*.go' | grep -v pb.go | grep -v vendor)
+SED?=$(shell command -v gsed || command -v sed)
 
-GO_VERSION_MIN=1.11
-CGO_ENABLED=0
+GO_VERSION_MIN=$$(cat $(CURDIR)/.go-version)
+GO_CMD?=go
+CGO_ENABLED?=0
 ifneq ($(FDB_ENABLED), )
 	CGO_ENABLED=1
 	BUILD_TAGS+=foundationdb
@@ -29,10 +34,13 @@ bin: prep
 
 # dev creates binaries for testing Vault locally. These are put
 # into ./bin/ as well as $GOPATH/bin
+dev: BUILD_TAGS+=testonly
 dev: prep
 	@CGO_ENABLED=$(CGO_ENABLED) BUILD_TAGS='$(BUILD_TAGS)' VAULT_DEV_BUILD=1 sh -c "'$(CURDIR)/scripts/build.sh'"
-dev-ui: prep
+dev-ui: BUILD_TAGS+=testonly
+dev-ui: assetcheck prep
 	@CGO_ENABLED=$(CGO_ENABLED) BUILD_TAGS='$(BUILD_TAGS) ui' VAULT_DEV_BUILD=1 sh -c "'$(CURDIR)/scripts/build.sh'"
+dev-dynamic: BUILD_TAGS+=testonly
 dev-dynamic: prep
 	@CGO_ENABLED=1 BUILD_TAGS='$(BUILD_TAGS)' VAULT_DEV_BUILD=1 sh -c "'$(CURDIR)/scripts/build.sh'"
 
@@ -42,46 +50,54 @@ dev-dynamic: prep
 dev-mem: BUILD_TAGS+=memprofiler
 dev-mem: dev
 dev-ui-mem: BUILD_TAGS+=memprofiler
-dev-ui-mem: dev-ui
+dev-ui-mem: assetcheck dev-ui
 dev-dynamic-mem: BUILD_TAGS+=memprofiler
 dev-dynamic-mem: dev-dynamic
 
-testtravis: BUILD_TAGS+=travis
-testtravis: test
+# Creates a Docker image by adding the compiled linux/amd64 binary found in ./bin.
+# The resulting image is tagged "vault:dev".
+docker-dev: BUILD_TAGS+=testonly
+docker-dev: prep
+	docker build --build-arg VERSION=$(GO_VERSION_MIN) --build-arg BUILD_TAGS="$(BUILD_TAGS)" -f scripts/docker/Dockerfile -t vault:dev .
 
-testracetravis: BUILD_TAGS+=travis
-testracetravis: testrace
+docker-dev-ui: BUILD_TAGS+=testonly
+docker-dev-ui: prep
+	docker build --build-arg VERSION=$(GO_VERSION_MIN) --build-arg BUILD_TAGS="$(BUILD_TAGS)" -f scripts/docker/Dockerfile.ui -t vault:dev-ui .
 
 # test runs the unit tests and vets the code
+test: BUILD_TAGS+=testonly
 test: prep
 	@CGO_ENABLED=$(CGO_ENABLED) \
 	VAULT_ADDR= \
 	VAULT_TOKEN= \
 	VAULT_DEV_ROOT_TOKEN_ID= \
 	VAULT_ACC= \
-	go test -tags='$(BUILD_TAGS)' $(TEST) $(TESTARGS) -timeout=$(TEST_TIMEOUT) -parallel=20
+	$(GO_CMD) test -tags='$(BUILD_TAGS)' $(TEST) $(TESTARGS) -timeout=$(TEST_TIMEOUT) -parallel=20
 
+testcompile: BUILD_TAGS+=testonly
 testcompile: prep
 	@for pkg in $(TEST) ; do \
-		go test -v -c -tags='$(BUILD_TAGS)' $$pkg -parallel=4 ; \
+		$(GO_CMD) test -v -c -tags='$(BUILD_TAGS)' $$pkg -parallel=4 ; \
 	done
 
 # testacc runs acceptance tests
+testacc: BUILD_TAGS+=testonly
 testacc: prep
 	@if [ "$(TEST)" = "./..." ]; then \
 		echo "ERROR: Set TEST to a specific package"; \
 		exit 1; \
 	fi
-	VAULT_ACC=1 go test -tags='$(BUILD_TAGS)' $(TEST) -v $(TESTARGS) -timeout=$(EXTENDED_TEST_TIMEOUT)
+	VAULT_ACC=1 $(GO_CMD) test -tags='$(BUILD_TAGS)' $(TEST) -v $(TESTARGS) -timeout=$(EXTENDED_TEST_TIMEOUT)
 
 # testrace runs the race checker
+testrace: BUILD_TAGS+=testonly
 testrace: prep
 	@CGO_ENABLED=1 \
 	VAULT_ADDR= \
 	VAULT_TOKEN= \
 	VAULT_DEV_ROOT_TOKEN_ID= \
 	VAULT_ACC= \
-	go test -tags='$(BUILD_TAGS)' -race $(TEST) $(TESTARGS) -timeout=$(EXTENDED_TEST_TIMEOUT) -parallel=20
+	$(GO_CMD) test -tags='$(BUILD_TAGS)' -race $(TEST) $(TESTARGS) -timeout=$(EXTENDED_TEST_TIMEOUT) -parallel=20
 
 cover:
 	./scripts/coverage.sh --html
@@ -89,112 +105,250 @@ cover:
 # vet runs the Go source code static analysis tool `vet` to find
 # any common errors.
 vet:
-	@go list -f '{{.Dir}}' ./... | grep -v /vendor/ \
+	@$(GO_CMD) list -f '{{.Dir}}' ./... | grep -v /vendor/ \
 		| grep -v '.*github.com/hashicorp/vault$$' \
-		| xargs go tool vet ; if [ $$? -eq 1 ]; then \
+		| xargs $(GO_CMD) vet ; if [ $$? -eq 1 ]; then \
 			echo ""; \
 			echo "Vet found suspicious constructs. Please check the reported constructs"; \
 			echo "and fix them if necessary before submitting the code for reviewal."; \
 		fi
 
+# deprecations runs staticcheck tool to look for deprecations. Checks entire code to see if it 
+# has deprecated function, variable, constant or field
+deprecations: bootstrap prep
+	@BUILD_TAGS='$(BUILD_TAGS)' ./scripts/deprecations-checker.sh ""
+
+# ci-deprecations runs staticcheck tool to look for deprecations. All output gets piped to revgrep
+# which will only return an error if changes that is not on main has deprecated function, variable, constant or field
+ci-deprecations: ci-bootstrap prep
+	@BUILD_TAGS='$(BUILD_TAGS)' ./scripts/deprecations-checker.sh main
+
+tools/codechecker/.bin/codechecker:
+	@cd tools/codechecker && $(GO_CMD) build -o .bin/codechecker .
+
+# vet-codechecker runs our custom linters on the test functions. All output gets
+# piped to revgrep which will only return an error if new piece of code violates
+# the check 
+vet-codechecker: bootstrap tools/codechecker/.bin/codechecker prep
+	@$(GO_CMD) vet -vettool=./tools/codechecker/.bin/codechecker -tags=$(BUILD_TAGS) ./... 2>&1 | revgrep
+
+# vet-codechecker runs our custom linters on the test functions. All output gets
+# piped to revgrep which will only return an error if new piece of code that is 
+# not on main violates the check 
+ci-vet-codechecker: ci-bootstrap tools/codechecker/.bin/codechecker prep
+	@$(GO_CMD) vet -vettool=./tools/codechecker/.bin/codechecker -tags=$(BUILD_TAGS) ./... 2>&1 | revgrep origin/main
+
+# lint runs vet plus a number of other checkers, it is more comprehensive, but louder
+lint:
+	@$(GO_CMD) list -f '{{.Dir}}' ./... | grep -v /vendor/ \
+		| xargs golangci-lint run; if [ $$? -eq 1 ]; then \
+			echo ""; \
+			echo "Lint found suspicious constructs. Please check the reported constructs"; \
+			echo "and fix them if necessary before submitting the code for reviewal."; \
+		fi
+# for ci jobs, runs lint against the changed packages in the commit
+ci-lint:
+	@golangci-lint run --deadline 10m --new-from-rev=HEAD~
+
+# Lint protobuf files
+protolint: ci-bootstrap
+	buf lint
+
 # prep runs `go generate` to build the dynamically generated
 # source files.
-prep: fmtcheck
+#
+# n.b.: prep used to depend on fmtcheck, but since fmtcheck is
+# now run as a pre-commit hook (and there's little value in
+# making every build run the formatter), we've removed that
+# dependency.
+prep:
 	@sh -c "'$(CURDIR)/scripts/goversioncheck.sh' '$(GO_VERSION_MIN)'"
-	@go generate $(go list ./... | grep -v /vendor/)
+	@GOARCH= GOOS= $(GO_CMD) generate $$($(GO_CMD) list ./... | grep -v /vendor/)
 	@if [ -d .git/hooks ]; then cp .hooks/* .git/hooks/; fi
 
-# bootstrap the build by downloading additional tools
-bootstrap:
-	@for tool in  $(EXTERNAL_TOOLS) ; do \
+# bootstrap the build by downloading additional tools needed to build
+ci-bootstrap: .ci-bootstrap
+.ci-bootstrap:
+	@for tool in  $(EXTERNAL_TOOLS_CI) ; do \
 		echo "Installing/Updating $$tool" ; \
-		go get -u $$tool; \
+		GO111MODULE=off $(GO_CMD) get -u $$tool; \
 	done
+	@touch .ci-bootstrap
+
+# bootstrap the build by downloading additional tools that may be used by devs
+bootstrap: ci-bootstrap
+	go generate -tags tools tools/tools.go
+	go install github.com/bufbuild/buf/cmd/buf@v1.25.0
 
 # Note: if you have plugins in GOPATH you can update all of them via something like:
 # for i in $(ls | grep vault-plugin-); do cd $i; git remote update; git reset --hard origin/master; dep ensure -update; git add .; git commit; git push; cd ..; done
 update-plugins:
-	grep vault-plugin- vendor/vendor.json | cut -d '"' -f 4 | xargs govendor fetch
+	grep vault-plugin- go.mod | cut -d ' ' -f 1 | while read -r P; do echo "Updating $P..."; go get -v "$P"; done
 
-static-assets:
-	@echo "--> Generating static assets"
-	@go-bindata-assetfs -o bindata_assetfs.go -pkg http -prefix pkg -modtime 1480000000 -tags ui ./pkg/web_ui/...
-	@mv bindata_assetfs.go http
-	@$(MAKE) -f $(THIS_FILE) fmt
+static-assets-dir:
+	@mkdir -p ./http/web_ui
 
-test-ember:
+install-ui-dependencies:
 	@echo "--> Installing JavaScript assets"
-	@cd ui && yarn --ignore-optional
+	@cd ui && yarn
+
+test-ember: install-ui-dependencies
 	@echo "--> Running ember tests"
-	@cd ui && yarn run test-oss
+	@cd ui && yarn run test:oss
 
-ember-dist:
-	@echo "--> Installing JavaScript assets"
-	@cd ui && yarn --ignore-optional
+test-ember-enos: install-ui-dependencies
+	@echo "--> Running ember tests with a real backend"
+	@cd ui && yarn run test:enos
+
+check-vault-in-path:
+	@VAULT_BIN=$$(command -v vault) || { echo "vault command not found"; exit 1; }; \
+		[ -x "$$VAULT_BIN" ] || { echo "$$VAULT_BIN not executable"; exit 1; }; \
+		printf "Using Vault at %s:\n\$$ vault version\n%s\n" "$$VAULT_BIN" "$$(vault version)"
+
+ember-dist: install-ui-dependencies
 	@cd ui && npm rebuild node-sass
 	@echo "--> Building Ember application"
 	@cd ui && yarn run build
 	@rm -rf ui/if-you-need-to-delete-this-open-an-issue-async-disk-cache
 
-ember-dist-dev:
-	@echo "--> Installing JavaScript assets"
-	@cd ui && yarn --ignore-optional
+ember-dist-dev: install-ui-dependencies
 	@cd ui && npm rebuild node-sass
 	@echo "--> Building Ember application"
-	@cd ui && yarn run build-dev
+	@cd ui && yarn run build:dev
 
-static-dist: ember-dist static-assets
-static-dist-dev: ember-dist-dev static-assets
+static-dist: ember-dist
+static-dist-dev: ember-dist-dev
 
-proto:
-	protoc vault/*.proto --go_out=plugins=grpc:../../..
-	protoc helper/storagepacker/types.proto --go_out=plugins=grpc:../../..
-	protoc helper/forwarding/types.proto --go_out=plugins=grpc:../../..
-	protoc logical/*.proto --go_out=plugins=grpc:../../..
-	protoc physical/types.proto --go_out=plugins=grpc:../../..
-	protoc helper/identity/mfa/types.proto --go_out=plugins=grpc:../../..
-	protoc helper/identity/types.proto --go_out=plugins=grpc:../../..
-	protoc builtin/logical/database/dbplugin/*.proto --go_out=plugins=grpc:../../..
-	protoc logical/plugin/pb/*.proto --go_out=plugins=grpc:../../..
-	sed -i '1s;^;// +build !enterprise\n;' helper/identity/mfa/types.pb.go
-	sed -i -e 's/Idp/IDP/' -e 's/Url/URL/' -e 's/Id/ID/' -e 's/IDentity/Identity/' -e 's/EntityId/EntityID/' -e 's/Api/API/' -e 's/Qr/QR/' -e 's/Totp/TOTP/' -e 's/Mfa/MFA/' -e 's/Pingid/PingID/' -e 's/protobuf:"/sentinel:"" protobuf:"/' -e 's/namespaceId/namespaceID/' -e 's/Ttl/TTL/' -e 's/BoundCidrs/BoundCIDRs/' helper/identity/types.pb.go helper/storagepacker/types.pb.go logical/plugin/pb/backend.pb.go logical/identity.pb.go
-	sed -i -e 's/Iv/IV/' -e 's/Hmac/HMAC/' physical/types.pb.go
+proto: bootstrap
+	buf generate
+
+	# No additional sed expressions should be added to this list. Going forward
+	# we should just use the variable names choosen by protobuf. These are left
+	# here for backwards compatability, namely for SDK compilation.
+	$(SED) -i -e 's/Id/ID/' -e 's/SPDX-License-IDentifier/SPDX-License-Identifier/' vault/request_forwarding_service.pb.go
+	$(SED) -i -e 's/Idp/IDP/' -e 's/Url/URL/' -e 's/Id/ID/' -e 's/IDentity/Identity/' -e 's/EntityId/EntityID/' -e 's/Api/API/' -e 's/Qr/QR/' -e 's/Totp/TOTP/' -e 's/Mfa/MFA/' -e 's/Pingid/PingID/' -e 's/namespaceId/namespaceID/' -e 's/Ttl/TTL/' -e 's/BoundCidrs/BoundCIDRs/' -e 's/SPDX-License-IDentifier/SPDX-License-Identifier/' helper/identity/types.pb.go helper/identity/mfa/types.pb.go helper/storagepacker/types.pb.go sdk/plugin/pb/backend.pb.go sdk/logical/identity.pb.go vault/activity/activity_log.pb.go
+
+	# This will inject the sentinel struct tags as decorated in the proto files.
+	protoc-go-inject-tag -input=./helper/identity/types.pb.go
+	protoc-go-inject-tag -input=./helper/identity/mfa/types.pb.go
 
 fmtcheck:
-	@true
-#@sh -c "'$(CURDIR)/scripts/gofmtcheck.sh'"
+	@sh -c "'$(CURDIR)/scripts/gofmtcheck.sh'"
 
-fmt:
-	gofmt -w $(GOFMT_FILES)
+fmt: ci-bootstrap
+	find . -name '*.go' | grep -v pb.go | grep -v vendor | xargs go run mvdan.cc/gofumpt -w
+
+protofmt: ci-bootstrap
+	buf format -w
+
+semgrep:
+	semgrep --include '*.go' --exclude 'vendor' -a -f tools/semgrep .
+
+semgrep-ci:
+	semgrep --error --include '*.go' --exclude 'vendor' -f tools/semgrep/ci .
+
+assetcheck:
+	@echo "==> Checking compiled UI assets..."
+	@sh -c "'$(CURDIR)/scripts/assetcheck.sh'"
 
 spellcheck:
 	@echo "==> Spell checking website..."
 	@misspell -error -source=text website/source
 
 mysql-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/mysql-database-plugin ./plugins/database/mysql/mysql-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/mysql-database-plugin ./plugins/database/mysql/mysql-database-plugin
 
 mysql-legacy-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/mysql-legacy-database-plugin ./plugins/database/mysql/mysql-legacy-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/mysql-legacy-database-plugin ./plugins/database/mysql/mysql-legacy-database-plugin
 
 cassandra-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/cassandra-database-plugin ./plugins/database/cassandra/cassandra-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/cassandra-database-plugin ./plugins/database/cassandra/cassandra-database-plugin
 
 influxdb-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/influxdb-database-plugin ./plugins/database/influxdb/influxdb-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/influxdb-database-plugin ./plugins/database/influxdb/influxdb-database-plugin
 
 postgresql-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/postgresql-database-plugin ./plugins/database/postgresql/postgresql-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/postgresql-database-plugin ./plugins/database/postgresql/postgresql-database-plugin
 
 mssql-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/mssql-database-plugin ./plugins/database/mssql/mssql-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/mssql-database-plugin ./plugins/database/mssql/mssql-database-plugin
 
 hana-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/hana-database-plugin ./plugins/database/hana/hana-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/hana-database-plugin ./plugins/database/hana/hana-database-plugin
 
 mongodb-database-plugin:
-	@CGO_ENABLED=0 go build -o bin/mongodb-database-plugin ./plugins/database/mongodb/mongodb-database-plugin
+	@CGO_ENABLED=0 $(GO_CMD) build -o bin/mongodb-database-plugin ./plugins/database/mongodb/mongodb-database-plugin
 
-.PHONY: bin default prep test vet bootstrap fmt fmtcheck mysql-database-plugin mysql-legacy-database-plugin cassandra-database-plugin influxdb-database-plugin postgresql-database-plugin mssql-database-plugin hana-database-plugin mongodb-database-plugin static-assets ember-dist ember-dist-dev static-dist static-dist-dev
+.PHONY: bin default prep test vet bootstrap ci-bootstrap fmt fmtcheck mysql-database-plugin mysql-legacy-database-plugin cassandra-database-plugin influxdb-database-plugin postgresql-database-plugin mssql-database-plugin hana-database-plugin mongodb-database-plugin ember-dist ember-dist-dev static-dist static-dist-dev assetcheck check-vault-in-path packages build build-ci semgrep semgrep-ci vet-codechecker ci-vet-codechecker 
 
-.NOTPARALLEL: ember-dist ember-dist-dev static-assets
+.NOTPARALLEL: ember-dist ember-dist-dev
+
+# These ci targets are used for used for building and testing in Github Actions
+# workflows and for Enos scenarios.
+.PHONY: ci-build
+ci-build:
+	@$(CURDIR)/scripts/ci-helper.sh build
+
+.PHONY: ci-build-ui
+ci-build-ui:
+	@$(CURDIR)/scripts/ci-helper.sh build-ui
+
+.PHONY: ci-bundle
+ci-bundle:
+	@$(CURDIR)/scripts/ci-helper.sh bundle
+
+.PHONY: ci-filter-matrix
+ci-filter-matrix:
+	@$(CURDIR)/scripts/ci-helper.sh matrix-filter-file
+
+.PHONY: ci-get-artifact-basename
+ci-get-artifact-basename:
+	@$(CURDIR)/scripts/ci-helper.sh artifact-basename
+
+.PHONY: ci-get-date
+ci-get-date:
+	@$(CURDIR)/scripts/ci-helper.sh date
+
+.PHONY: ci-get-matrix-group-id
+ci-get-matrix-group-id:
+	@$(CURDIR)/scripts/ci-helper.sh matrix-group-id
+
+.PHONY: ci-get-revision
+ci-get-revision:
+	@$(CURDIR)/scripts/ci-helper.sh revision
+
+.PHONY: ci-get-version
+ci-get-version:
+	@$(CURDIR)/scripts/ci-helper.sh version
+
+.PHONY: ci-get-version-base
+ci-get-version-base:
+	@$(CURDIR)/scripts/ci-helper.sh version-base
+
+.PHONY: ci-get-version-major
+ci-get-version-major:
+	@$(CURDIR)/scripts/ci-helper.sh version-major
+
+.PHONY: ci-get-version-meta
+ci-get-version-meta:
+	@$(CURDIR)/scripts/ci-helper.sh version-meta
+
+.PHONY: ci-get-version-minor
+ci-get-version-minor:
+	@$(CURDIR)/scripts/ci-helper.sh version-minor
+
+.PHONY: ci-get-version-package
+ci-get-version-package:
+	@$(CURDIR)/scripts/ci-helper.sh version-package
+
+.PHONY: ci-get-version-patch
+ci-get-version-patch:
+	@$(CURDIR)/scripts/ci-helper.sh version-patch
+
+.PHONY: ci-get-version-pre
+ci-get-version-pre:
+	@$(CURDIR)/scripts/ci-helper.sh version-pre
+
+.PHONY: ci-prepare-legal
+ci-prepare-legal:
+	@$(CURDIR)/scripts/ci-helper.sh prepare-legal

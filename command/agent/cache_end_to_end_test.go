@@ -1,3 +1,6 @@
+// Copyright (c) HashiCorp, Inc.
+// SPDX-License-Identifier: MPL-2.0
+
 package agent
 
 import (
@@ -14,16 +17,17 @@ import (
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/api"
 	credAppRole "github.com/hashicorp/vault/builtin/credential/approle"
-	"github.com/hashicorp/vault/command/agent/auth"
-	agentapprole "github.com/hashicorp/vault/command/agent/auth/approle"
-	"github.com/hashicorp/vault/command/agent/cache"
-	"github.com/hashicorp/vault/command/agent/sink"
-	"github.com/hashicorp/vault/command/agent/sink/file"
-	"github.com/hashicorp/vault/command/agent/sink/inmem"
-	"github.com/hashicorp/vault/helper/consts"
-	"github.com/hashicorp/vault/helper/logging"
+	"github.com/hashicorp/vault/command/agentproxyshared/auth"
+	agentapprole "github.com/hashicorp/vault/command/agentproxyshared/auth/approle"
+	cache "github.com/hashicorp/vault/command/agentproxyshared/cache"
+	"github.com/hashicorp/vault/command/agentproxyshared/sink"
+	"github.com/hashicorp/vault/command/agentproxyshared/sink/file"
+	"github.com/hashicorp/vault/command/agentproxyshared/sink/inmem"
+	"github.com/hashicorp/vault/helper/useragent"
 	vaulthttp "github.com/hashicorp/vault/http"
-	"github.com/hashicorp/vault/logical"
+	"github.com/hashicorp/vault/sdk/helper/consts"
+	"github.com/hashicorp/vault/sdk/helper/logging"
+	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/hashicorp/vault/vault"
 )
 
@@ -41,9 +45,6 @@ func TestCache_UsingAutoAuthToken(t *testing.T) {
 	var err error
 	logger := logging.NewVaultLogger(log.Trace)
 	coreConfig := &vault.CoreConfig{
-		DisableMlock: true,
-		DisableCache: true,
-		Logger:       log.NewNullLogger(),
 		LogicalBackends: map[string]logical.Factory{
 			"kv": vault.LeasedPassthroughBackendFactory,
 		},
@@ -151,11 +152,7 @@ func TestCache_UsingAutoAuthToken(t *testing.T) {
 	os.Remove(out)
 	t.Logf("output: %s", out)
 
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	timer := time.AfterFunc(30*time.Second, func() {
-		cancelFunc()
-	})
-	defer timer.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 	conf := map[string]interface{}{
 		"role_id_file_path":                   role,
@@ -167,8 +164,10 @@ func TestCache_UsingAutoAuthToken(t *testing.T) {
 
 	// Create the API proxier
 	apiProxy, err := cache.NewAPIProxy(&cache.APIProxyConfig{
-		Client: client,
-		Logger: cacheLogger.Named("apiproxy"),
+		Client:                  client,
+		Logger:                  cacheLogger.Named("apiproxy"),
+		UserAgentStringFunction: useragent.ProxyStringWithProxiedUserAgent,
+		UserAgentString:         useragent.ProxyAPIProxyString(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -199,9 +198,18 @@ func TestCache_UsingAutoAuthToken(t *testing.T) {
 		Client: client,
 	}
 	ah := auth.NewAuthHandler(ahConfig)
-	go ah.Run(ctx, am)
+	errCh := make(chan error)
+	go func() {
+		errCh <- ah.Run(ctx, am)
+	}()
 	defer func() {
-		<-ah.DoneCh
+		select {
+		case <-ctx.Done():
+		case err := <-errCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	}()
 
 	config := &sink.SinkConfig{
@@ -231,13 +239,25 @@ func TestCache_UsingAutoAuthToken(t *testing.T) {
 	}
 	inmemSinkConfig.Sink = inmemSink
 
-	go ss.Run(ctx, ah.OutputCh, []*sink.SinkConfig{config, inmemSinkConfig})
+	go func() {
+		errCh <- ss.Run(ctx, ah.OutputCh, []*sink.SinkConfig{config, inmemSinkConfig})
+	}()
 	defer func() {
-		<-ss.DoneCh
+		select {
+		case <-ctx.Done():
+		case err := <-errCh:
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
 	}()
 
-	// This has to be after the other defers so it happens first
-	defer cancelFunc()
+	// This has to be after the other defers so it happens first. It allows
+	// successful test runs to immediately cancel all of the runner goroutines
+	// and unblock any of the blocking defer calls by the runner's DoneCh that
+	// comes before this and avoid successful tests from taking the entire
+	// timeout duration.
+	defer cancel()
 
 	// Check that no sink file exists
 	_, err = os.Lstat(out)
@@ -248,13 +268,13 @@ func TestCache_UsingAutoAuthToken(t *testing.T) {
 		t.Fatal("expected notexist err")
 	}
 
-	if err := ioutil.WriteFile(role, []byte(roleID1), 0600); err != nil {
+	if err := ioutil.WriteFile(role, []byte(roleID1), 0o600); err != nil {
 		t.Fatal(err)
 	} else {
 		logger.Trace("wrote test role 1", "path", role)
 	}
 
-	if err := ioutil.WriteFile(secret, []byte(secretID1), 0600); err != nil {
+	if err := ioutil.WriteFile(secret, []byte(secretID1), 0o600); err != nil {
 		t.Fatal(err)
 	} else {
 		logger.Trace("wrote test secret 1", "path", secret)
@@ -298,7 +318,7 @@ func TestCache_UsingAutoAuthToken(t *testing.T) {
 	mux.Handle(consts.AgentPathCacheClear, leaseCache.HandleCacheClear(ctx))
 
 	// Passing a non-nil inmemsink tells the agent to use the auto-auth token
-	mux.Handle("/", cache.Handler(ctx, cacheLogger, leaseCache, inmemSink))
+	mux.Handle("/", cache.ProxyHandler(ctx, cacheLogger, leaseCache, inmemSink, true))
 	server := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
